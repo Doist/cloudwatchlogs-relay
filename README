@@ -1,0 +1,42 @@
+Program cloudwatchlogs-relay listens for rsyslogd messages over unix socket
+and sends messages to CloudWatch logs.
+
+To send all logged messages on a host to CloudWatch Logs, configure rsyslogd
+by creating file /etc/rsyslog.d/cloudwatch.conf with the following content:
+
+    $ModLoad omuxsock
+    $OMUxSockSocket /var/run/cloudwatch
+    *.* :omuxsock:
+
+Restart rsyslogd, and run this program like this:
+
+    cloudwatchlogs-relay -socket=/var/run/cloudwatch -name=/groupname/rsyslogd
+
+This will create log group "/groupname/rsyslogd", and inside it a log stream
+with either "rsyslogd/instance-id/${INSTANCE_ID}", or
+"rsyslogd/hostname/${HOSTNAME}" name (host name is used if instance ID
+cannot be discovered from EC2 instance metadata endpoint).
+
+Program requires the following IAM permissions:
+
+    {
+    	"Version": "2012-10-17",
+    	"Statement": [
+    		{
+    			"Effect": "Allow",
+    			"Action": [
+    				"logs:CreateLogGroup",
+    				"logs:CreateLogStream",
+    				"logs:PutLogEvents"
+    			],
+    			"Resource": "*"
+    		}
+    	]
+    }
+
+Note that while program tries to remove socket on clean shutdown, it is
+still possible that leftover socket file may be left, preventing new
+instance from starting.
+
+It relies on AWS SDK and expects to find credentials/region settings in
+usual places (IAM role, environment, configuration files).
