@@ -10,28 +10,32 @@ by creating file /etc/rsyslog.d/cloudwatch.conf with the following content:
 
 Restart rsyslogd, and run this program like this:
 
-    cloudwatchlogs-relay -socket=/var/run/cloudwatch -name=/groupname/rsyslogd
+    cloudwatchlogs-relay -socket=/var/run/cloudwatch \
+        -group=/groupname/rsyslogd \
+        -stream='instance/${INSTANCE_ID}'
 
 This will create log group "/groupname/rsyslogd", and inside it a log stream
-with either "rsyslogd/instance-id/${INSTANCE_ID}", or
-"rsyslogd/hostname/${HOSTNAME}" name (host name is used if instance ID
-cannot be discovered from EC2 instance metadata endpoint).
+"instance/${INSTANCE_ID}", where ${INSTANCE_ID} would be replaced with EC2
+instance ID. Supported placeholders for replacement are: ${HOSTNAME},
+${INSTANCE_ID}, ${RANDOM} — for instance ID, hostname, and random string. Be
+careful to make sure placeholders are not expanded by the shell (use single
+quotes).
 
 Program requires the following IAM permissions:
 
     {
-    	"Version": "2012-10-17",
-    	"Statement": [
-    		{
-    			"Effect": "Allow",
-    			"Action": [
-    				"logs:CreateLogGroup",
-    				"logs:CreateLogStream",
-    				"logs:PutLogEvents"
-    			],
-    			"Resource": "*"
-    		}
-    	]
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                ],
+                "Resource": "*"
+            }
+        ]
     }
 
 Note that while program tries to remove socket on clean shutdown, it is

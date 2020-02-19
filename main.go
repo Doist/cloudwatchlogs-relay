@@ -10,29 +10,33 @@
 //
 // Restart rsyslogd, and run this program like this:
 //
-//  cloudwatchlogs-relay -socket=/var/run/cloudwatch -name=/groupname/rsyslogd
+//  cloudwatchlogs-relay -socket=/var/run/cloudwatch \
+//      -group=/groupname/rsyslogd \
+//      -stream='instance/${INSTANCE_ID}'
 //
 // This will create log group "/groupname/rsyslogd", and inside it a log stream
-// with either "rsyslogd/instance-id/${INSTANCE_ID}", or
-// "rsyslogd/hostname/${HOSTNAME}" name (host name is used if instance ID
-// cannot be discovered from EC2 instance metadata endpoint).
+// "instance/${INSTANCE_ID}", where ${INSTANCE_ID} would be replaced with EC2
+// instance ID. Supported placeholders for replacement are: ${HOSTNAME},
+// ${INSTANCE_ID}, ${RANDOM} — for instance ID, hostname, and random string. Be
+// careful to make sure placeholders are not expanded by the shell (use single
+// quotes).
 //
 // Program requires the following IAM permissions:
 //
-//	{
-//		"Version": "2012-10-17",
-//		"Statement": [
-//			{
-//				"Effect": "Allow",
-//				"Action": [
-//					"logs:CreateLogGroup",
-//					"logs:CreateLogStream",
-//					"logs:PutLogEvents"
-//				],
-//				"Resource": "*"
-//			}
-//		]
-//	}
+//  {
+//      "Version": "2012-10-17",
+//      "Statement": [
+//          {
+//              "Effect": "Allow",
+//              "Action": [
+//                  "logs:CreateLogGroup",
+//                  "logs:CreateLogStream",
+//                  "logs:PutLogEvents"
+//              ],
+//              "Resource": "*"
+//          }
+//      ]
+//  }
 //
 // Note that while program tries to remove socket on clean shutdown, it is
 // still possible that leftover socket file may be left, preventing new
@@ -45,6 +49,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -53,6 +58,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -67,7 +73,9 @@ func main() {
 	args := runArgs{
 		Addr: "/var/run/cloudwatch",
 	}
-	flag.StringVar(&args.Name, "name", args.Name, "CloudWatch Logs group name")
+	flag.StringVar(&args.Group, "group", args.Group, "CloudWatch Logs group name")
+	flag.StringVar(&args.Stream, "stream", args.Stream, "CloudWatch Logs stream name; "+
+		"supports replacements:\n${HOSTNAME}, ${INSTANCE_ID}, ${RANDOM}")
 	flag.StringVar(&args.Addr, "socket", args.Addr, "path to unix socket to receive messages from rsyslogd")
 	flag.Parse()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -81,13 +89,17 @@ func main() {
 }
 
 type runArgs struct {
-	Name string // CloudWatch Logs group name
-	Addr string // path to unix socket
+	Group  string // CloudWatch Logs group name
+	Stream string // CloudWatch Logs stream name
+	Addr   string // path to unix socket
 }
 
 func (args *runArgs) check() error {
-	if args.Name == "" {
+	if args.Group == "" {
 		return errors.New("log group name must be set")
+	}
+	if args.Stream == "" {
+		return errors.New("log stream name must be set")
 	}
 	if args.Addr == "" {
 		return errors.New("path to unix socket must be set")
@@ -99,8 +111,18 @@ func run(ctx context.Context, args runArgs) error {
 	if err := args.check(); err != nil {
 		return err
 	}
+	sess, err := session.NewSession()
+	if err != nil {
+		return err
+	}
+	stream := &logStream{Group: args.Group}
+	if stream.Stream, err = expandVars(sess, args.Stream); err != nil {
+		return fmt.Errorf("%q expanding: %w", args.Stream, err)
+	}
+	svc := cloudwatchlogs.New(sess)
 	group, ctx := errgroup.WithContext(ctx)
 	ch := make(chan *message, 100)
+	group.Go(func() error { return logFeeder(ctx, svc, stream, ch) })
 	group.Go(func() error {
 		pc, err := net.ListenPacket("unixgram", args.Addr)
 		if err != nil {
@@ -140,24 +162,10 @@ func run(ctx context.Context, args runArgs) error {
 			}
 		}
 	})
-	group.Go(func() error { return logFeeder(ctx, args.Name, ch) })
 	return group.Wait()
 }
 
-func logFeeder(ctx context.Context, name string, ch <-chan *message) error {
-	sess, err := session.NewSession()
-	if err != nil {
-		return err
-	}
-	stream := logStream{Group: name}
-	if meta, err := ec2metadata.New(sess).GetInstanceIdentityDocument(); err == nil {
-		stream.Stream = "rsyslogd/instance-id/" + meta.InstanceID
-	} else if name, err := os.Hostname(); err == nil {
-		stream.Stream = "rsyslogd/hostname/" + name
-	} else {
-		return fmt.Errorf("cannot figure out neither instance id nor hostname: %w", err)
-	}
-	svc := cloudwatchlogs.New(sess)
+func logFeeder(ctx context.Context, svc *cloudwatchlogs.CloudWatchLogs, stream *logStream, ch <-chan *message) error {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	var batch []*message
@@ -281,6 +289,54 @@ func lineToMessage(line []byte) (*message, error) {
 type message struct {
 	time time.Time
 	text string
+}
+
+// expandVars expands placeholders ${HOSTNAME}, ${INSTANCE_ID}, ${RANDOM} in a
+// string.
+func expandVars(sess *session.Session, s string) (string, error) {
+	if !strings.ContainsRune(s, '$') {
+		return s, nil
+	}
+	var err error
+	var hostname string
+	var instanceID string
+	var randomString string
+	s = os.Expand(s, func(v string) string {
+		if err != nil {
+			return ""
+		}
+		switch v {
+		case "HOSTNAME":
+			if hostname != "" {
+				return hostname
+			}
+			hostname, err = os.Hostname()
+			return hostname
+		case "INSTANCE_ID":
+			if instanceID != "" {
+				return instanceID
+			}
+			var meta ec2metadata.EC2InstanceIdentityDocument
+			meta, err = ec2metadata.New(sess).GetInstanceIdentityDocument()
+			if err != nil {
+				return ""
+			}
+			instanceID = meta.InstanceID
+			return instanceID
+		case "RANDOM":
+			if randomString != "" {
+				return randomString
+			}
+			b := make([]byte, 8)
+			if _, err = rand.Read(b); err != nil {
+				return ""
+			}
+			randomString = fmt.Sprintf("%x", b)
+			return randomString
+		}
+		return ""
+	})
+	return s, err
 }
 
 //go:generate sh -c "go doc > README"
