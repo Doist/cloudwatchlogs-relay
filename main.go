@@ -64,10 +64,7 @@ import (
 )
 
 func main() {
-	args := struct {
-		Name string // CloudWatch Logs group name
-		Addr string // path to unix socket
-	}{
+	args := runArgs{
 		Addr: "/var/run/cloudwatch",
 	}
 	flag.StringVar(&args.Name, "name", args.Name, "CloudWatch Logs group name")
@@ -77,29 +74,41 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	go func() { log.Print(<-sigCh); cancel() }()
-	if err := run(ctx, args.Name, args.Addr); err != nil {
+	if err := run(ctx, args); err != nil {
 		os.Stderr.WriteString(err.Error() + "\n")
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, name, addr string) error {
-	if name == "" {
+type runArgs struct {
+	Name string // CloudWatch Logs group name
+	Addr string // path to unix socket
+}
+
+func (args *runArgs) check() error {
+	if args.Name == "" {
 		return errors.New("log group name must be set")
 	}
-	if addr == "" {
+	if args.Addr == "" {
 		return errors.New("path to unix socket must be set")
+	}
+	return nil
+}
+
+func run(ctx context.Context, args runArgs) error {
+	if err := args.check(); err != nil {
+		return err
 	}
 	group, ctx := errgroup.WithContext(ctx)
 	ch := make(chan *message, 100)
 	group.Go(func() error {
-		pc, err := net.ListenPacket("unixgram", addr)
+		pc, err := net.ListenPacket("unixgram", args.Addr)
 		if err != nil {
 			return err
 		}
 		go func() { <-ctx.Done(); pc.Close() }()
 		defer pc.Close()
-		defer os.Remove(addr)
+		defer os.Remove(args.Addr)
 		b := make([]byte, 16*1024)
 		var readErr error
 		var n int
@@ -131,7 +140,7 @@ func run(ctx context.Context, name, addr string) error {
 			}
 		}
 	})
-	group.Go(func() error { return logFeeder(ctx, name, ch) })
+	group.Go(func() error { return logFeeder(ctx, args.Name, ch) })
 	return group.Wait()
 }
 
