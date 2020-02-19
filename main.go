@@ -152,6 +152,7 @@ func logFeeder(ctx context.Context, name string, ch <-chan *message) error {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	var batch []*message
+	const maxBatchSize = 100
 	for {
 		select {
 		case <-ctx.Done():
@@ -160,7 +161,11 @@ func logFeeder(ctx context.Context, name string, ch <-chan *message) error {
 			return stream.sendBatch(ctx, svc, batch)
 		case msg := <-ch:
 			batch = append(batch, msg)
-			continue
+			if len(batch) < maxBatchSize {
+				// if batch size reaches maxBatchSize threshold, proceed with
+				// sending it instead of accumulating further
+				continue
+			}
 		case <-ticker.C: // see logic below
 		}
 		if len(batch) == 0 {
@@ -169,8 +174,12 @@ func logFeeder(ctx context.Context, name string, ch <-chan *message) error {
 		if err := stream.sendBatch(ctx, svc, batch); err != nil {
 			return err
 		}
+		if len(batch) >= maxBatchSize { // don't retain slice if it has grown too big
+			batch = make([]*message, 10)
+			continue
+		}
 		for i := range batch {
-			batch[i] = nil
+			batch[i] = nil // assist garbage collector
 		}
 		batch = batch[:0]
 	}
@@ -220,7 +229,7 @@ func (s *logStream) sendBatch(ctx context.Context, svc *cloudwatchlogs.CloudWatc
 	}
 	for _, msg := range batch {
 		input.LogEvents = append(input.LogEvents, &cloudwatchlogs.InputLogEvent{
-			Message:   aws.String(msg.text),
+			Message:   &msg.text,
 			Timestamp: aws.Int64(msg.time.UnixNano() / int64(time.Millisecond)),
 		})
 	}
